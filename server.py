@@ -95,7 +95,8 @@ def http_get(url, timeout=25, accept="application/json,text/plain,*/*"):
         "User-Agent": UA,
         "Accept": accept,
         "Accept-Language": "en-US,en;q=0.9,da;q=0.8",
-        "Connection": "close",
+        "Connection": "keep-alive",
+        "Referer": "https://finance.yahoo.com/",
     })
     with _opener.open(req, timeout=timeout) as resp:
         return resp.status, resp.read().decode("utf-8", errors="replace")
@@ -108,18 +109,56 @@ def ensure_yahoo_session():
     global _crumb, _crumb_time
     if _crumb and (time.time() - _crumb_time) < 21600:
         return _crumb
-    for u in ["https://fc.yahoo.com", "https://finance.yahoo.com/quote/NVDA"]:
+
+    # ── Ny Yahoo consent-flow (2024/2025) ──────────────────────────────────
+    # Yahoo kræver nu cookie-consent (GUCS) FØR crumb kan hentes.
+    # Sæt consent-cookie manuelt og prøv begge query-hosts.
+    import http.cookiejar as _cj
+    consent_cookie = _cj.Cookie(
+        version=0, name="GUCS", value="AUdMzTfg",
+        port=None, port_specified=False,
+        domain=".yahoo.com", domain_specified=True, domain_initial_dot=True,
+        path="/", path_specified=True, secure=False,
+        expires=int(time.time()) + 86400 * 365,
+        discard=False, comment=None, comment_url=None, rest={},
+    )
+    _cookiejar.set_cookie(consent_cookie)
+
+    # Besøg finance.yahoo.com for at sætte yældrende cookies
+    for warmup in ["https://finance.yahoo.com", "https://fc.yahoo.com"]:
         try:
-            http_get(u, timeout=12, accept="text/html,*/*")
+            http_get(warmup, timeout=12, accept="text/html,application/xhtml+xml,*/*")
         except Exception:
             pass
-    status, text = http_get("https://query1.finance.yahoo.com/v1/test/getcrumb", timeout=15, accept="text/plain,*/*")
-    crumb = text.strip()
-    if status == 200 and crumb and "<html" not in crumb.lower() and len(crumb) < 200:
-        _crumb = crumb
-        _crumb_time = time.time()
-        return _crumb
-    raise RuntimeError("Kunne ikke hente Yahoo crumb/session")
+
+    # Prøv crumb-endpoint på begge query-hosts med fulde browser-headers
+    crumb_urls = [
+        "https://query1.finance.yahoo.com/v1/test/getcrumb",
+        "https://query2.finance.yahoo.com/v1/test/getcrumb",
+    ]
+    for crumb_url in crumb_urls:
+        try:
+            req = urllib.request.Request(crumb_url, headers={
+                "User-Agent": UA,
+                "Accept": "text/plain,application/json,*/*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://finance.yahoo.com/",
+                "Origin": "https://finance.yahoo.com",
+            })
+            with _opener.open(req, timeout=15) as resp:
+                crumb = resp.read().decode("utf-8", errors="replace").strip()
+            if crumb and "<html" not in crumb.lower() and len(crumb) < 200:
+                _crumb = crumb
+                _crumb_time = time.time()
+                return _crumb
+        except Exception:
+            pass
+
+    # Fallback: prøv uden crumb (chart-endpoint kræver det ikke)
+    # Returner tom streng - kald der kræver crumb vil bruge query uden den
+    _crumb = ""
+    _crumb_time = time.time()
+    return _crumb
 
 def raw(v):
     if isinstance(v, dict) and "raw" in v:
@@ -133,41 +172,94 @@ def yahoo_quote_batch(symbols):
     symbols = [yahoo_symbol(s) for s in symbols if s.strip()]
     if not symbols:
         return {}
-    cached_key = "quote_batch_" + "_".join(symbols)
+    cached_key = "quote_batch_" + "_".join(symbols[:10])  # kort cache-nøgle
     cached = read_cache(cached_key, 120)
     if cached:
         return cached
-    crumb = ensure_yahoo_session()
     fields = ",".join([
         "symbol","shortName","longName","regularMarketPrice","regularMarketPreviousClose",
         "regularMarketChangePercent","trailingPE","forwardPE","marketCap","currency",
         "fiftyTwoWeekHigh","fiftyTwoWeekLow","regularMarketTime","marketCap"
     ])
-    url = "https://query1.finance.yahoo.com/v7/finance/quote?" + urllib.parse.urlencode({
-        "symbols": ",".join(symbols),
-        "fields": fields,
-        "crumb": crumb
-    })
-    data = get_json(url, timeout=25)
-    results = data.get("quoteResponse", {}).get("result", [])
-    out = {(r.get("symbol") or "").upper(): r for r in results}
-    write_cache(cached_key, out)
-    return out
+    crumb = ""
+    try:
+        crumb = ensure_yahoo_session()
+    except Exception:
+        pass
+    for host in ["query1", "query2"]:
+        params = {"symbols": ",".join(symbols), "fields": fields}
+        if crumb:
+            params["crumb"] = crumb
+        url = f"https://{host}.finance.yahoo.com/v7/finance/quote?" + urllib.parse.urlencode(params)
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": UA,
+                "Accept": "application/json,*/*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://finance.yahoo.com/",
+            })
+            with _opener.open(req, timeout=25) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            results = data.get("quoteResponse", {}).get("result", [])
+            if results:
+                out = {(r.get("symbol") or "").upper(): r for r in results}
+                write_cache(cached_key, out)
+                return out
+        except Exception:
+            pass
+    return {}
 
 def yahoo_summary(symbol):
     symbol = yahoo_symbol(symbol)
     cached = read_cache("summary_" + symbol, 900)
     if cached:
         return cached
-    crumb = ensure_yahoo_session()
     modules = "price,summaryDetail,defaultKeyStatistics,financialData,incomeStatementHistory,balanceSheetHistory,cashflowStatementHistory,earningsTrend,recommendationTrend,upgradeDowngradeHistory,assetProfile,insiderHolders,insiderTransactions,netSharePurchaseActivity"
-    url = "https://query2.finance.yahoo.com/v10/finance/quoteSummary/" + urllib.parse.quote(symbol) + "?" + urllib.parse.urlencode({
-        "modules": modules,
-        "crumb": crumb
-    })
-    data = get_json(url, timeout=30)
-    write_cache("summary_" + symbol, data)
-    return data
+    crumb = ""
+    try:
+        crumb = ensure_yahoo_session()
+    except Exception:
+        pass
+    last_err = None
+    for host in ["query2", "query1"]:
+        params = {"modules": modules}
+        if crumb:
+            params["crumb"] = crumb
+        url = (f"https://{host}.finance.yahoo.com/v10/finance/quoteSummary/"
+               + urllib.parse.quote(symbol) + "?" + urllib.parse.urlencode(params))
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": UA,
+                "Accept": "application/json,*/*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://finance.yahoo.com/quote/" + symbol,
+            })
+            with _opener.open(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            # Tjek om vi fik et gyldigt svar (ikke en auth-fejl)
+            result = (data.get("quoteSummary", {}).get("result") or [None])[0]
+            if result is not None:
+                write_cache("summary_" + symbol, data)
+                return data
+            err_msg = str(data.get("quoteSummary", {}).get("error", ""))
+            if "401" in err_msg or "unauthorized" in err_msg.lower():
+                # Crumb er udløbet - nulstil og prøv igen
+                global _crumb, _crumb_time
+                _crumb = None
+                _crumb_time = 0
+                try:
+                    crumb = ensure_yahoo_session()
+                except Exception:
+                    pass
+                continue
+            # Returner data selv hvis result er None (kan være en gyldig tom respons)
+            write_cache("summary_" + symbol, data)
+            return data
+        except Exception as e:
+            last_err = e
+    if last_err:
+        raise last_err
+    return {}
 
 
 def yahoo_news(symbol):
@@ -568,13 +660,31 @@ def yahoo_chart(symbol):
     cached = read_cache("chart_" + symbol, 900)
     if cached:
         return cached
-    url = "https://query1.finance.yahoo.com/v8/finance/chart/" + urllib.parse.quote(symbol) + "?" + urllib.parse.urlencode({
-        "range": "1y",
-        "interval": "1d"
-    })
-    data = get_json(url, timeout=25)
-    write_cache("chart_" + symbol, data)
-    return data
+    # Prøv begge query-hosts med og uden crumb
+    params = {"range": "2y", "interval": "1d", "includePrePost": "false"}
+    try:
+        crumb = ensure_yahoo_session()
+        if crumb:
+            params["crumb"] = crumb
+    except Exception:
+        pass
+    last_err = None
+    for host in ["query1", "query2"]:
+        url = f"https://{host}.finance.yahoo.com/v8/finance/chart/" + urllib.parse.quote(symbol) + "?" + urllib.parse.urlencode(params)
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": UA,
+                "Accept": "application/json,*/*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://finance.yahoo.com/quote/" + symbol,
+            })
+            with _opener.open(req, timeout=25) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            write_cache("chart_" + symbol, data)
+            return data
+        except Exception as e:
+            last_err = e
+    raise last_err or RuntimeError("yahoo_chart fejlede for " + symbol)
 
 def calc_returns_from_chart(chart_data):
     result = (chart_data.get("chart", {}).get("result") or [None])[0]
@@ -2962,6 +3072,23 @@ class Handler(SimpleHTTPRequestHandler):
                 "source": "Yahoo Finance crumb/session", "batchSize": MAX_BATCH_SYMBOLS,
                 "workers": BATCH_WORKERS, "version": "stock-pro-10x-v10.4-split-screener-breakout-universes"
             })
+
+        if parsed.path == "/api/debug-session":
+            info = {"crumb_set": bool(_crumb), "crumb_age_sec": int(time.time()-_crumb_time) if _crumb_time else None}
+            try:
+                test_crumb = ensure_yahoo_session()
+                info["session_ok"] = True
+                info["crumb_preview"] = (test_crumb[:8] + "...") if test_crumb else "(tom-streng)"
+            except Exception as e:
+                info["session_ok"] = False
+                info["session_error"] = str(e)
+            try:
+                q = yahoo_quote_batch(["AAPL"])
+                aapl = q.get("AAPL", {})
+                info["quote_test"] = {"ok": bool(aapl), "price": aapl.get("regularMarketPrice")}
+            except Exception as e:
+                info["quote_test"] = {"ok": False, "error": str(e)}
+            return self.json_response(info)
         if parsed.path == "/api/yahoo-test":
             try:
                 ensure_yahoo_session()
