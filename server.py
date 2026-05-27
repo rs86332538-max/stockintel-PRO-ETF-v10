@@ -95,31 +95,51 @@ def http_get(url, timeout=25, accept="application/json,text/plain,*/*"):
         "User-Agent": UA,
         "Accept": accept,
         "Accept-Language": "en-US,en;q=0.9,da;q=0.8",
-        "Connection": "close",
+        "Connection": "keep-alive",
+        "Referer": "https://finance.yahoo.com/",
     })
     with _opener.open(req, timeout=timeout) as resp:
         return resp.status, resp.read().decode("utf-8", errors="replace")
 
 def get_json(url, timeout=25):
-    status, txt = http_get(url, timeout=timeout)
-    return json.loads(txt)
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": UA, "Accept": "application/json,text/plain,*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://finance.yahoo.com/", "Connection": "keep-alive",
+        })
+        with _opener.open(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8", errors="replace"))
+    except Exception:
+        alt = url.replace("query1.finance.yahoo.com","query2.finance.yahoo.com") if "query1" in url else url.replace("query2.finance.yahoo.com","query1.finance.yahoo.com")
+        if alt != url:
+            req2 = urllib.request.Request(alt, headers={"User-Agent": UA, "Accept": "application/json,*/*", "Referer": "https://finance.yahoo.com/"})
+            with _opener.open(req2, timeout=timeout) as resp2:
+                return json.loads(resp2.read().decode("utf-8", errors="replace"))
+        raise
 
 def ensure_yahoo_session():
     global _crumb, _crumb_time
     if _crumb and (time.time() - _crumb_time) < 21600:
         return _crumb
-    for u in ["https://fc.yahoo.com", "https://finance.yahoo.com/quote/NVDA"]:
+    import http.cookiejar as _cj
+    consent = _cj.Cookie(version=0, name="GUCS", value="AUdMzTfg", port=None, port_specified=False,
+        domain=".yahoo.com", domain_specified=True, domain_initial_dot=True,
+        path="/", path_specified=True, secure=False, expires=int(time.time())+86400*365,
+        discard=False, comment=None, comment_url=None, rest={})
+    _cookiejar.set_cookie(consent)
+    for u in ["https://finance.yahoo.com", "https://fc.yahoo.com"]:
+        try: http_get(u, timeout=12, accept="text/html,application/xhtml+xml,*/*")
+        except Exception: pass
+    for crumb_url in ["https://query1.finance.yahoo.com/v1/test/getcrumb", "https://query2.finance.yahoo.com/v1/test/getcrumb"]:
         try:
-            http_get(u, timeout=12, accept="text/html,*/*")
-        except Exception:
-            pass
-    status, text = http_get("https://query1.finance.yahoo.com/v1/test/getcrumb", timeout=15, accept="text/plain,*/*")
-    crumb = text.strip()
-    if status == 200 and crumb and "<html" not in crumb.lower() and len(crumb) < 200:
-        _crumb = crumb
-        _crumb_time = time.time()
-        return _crumb
-    raise RuntimeError("Kunne ikke hente Yahoo crumb/session")
+            req = urllib.request.Request(crumb_url, headers={"User-Agent": UA, "Accept": "text/plain,application/json,*/*", "Accept-Language": "en-US,en;q=0.9", "Referer": "https://finance.yahoo.com/", "Origin": "https://finance.yahoo.com"})
+            with _opener.open(req, timeout=15) as resp:
+                crumb = resp.read().decode("utf-8", errors="replace").strip()
+            if crumb and "<html" not in crumb.lower() and len(crumb) < 200:
+                _crumb = crumb; _crumb_time = time.time(); return _crumb
+        except Exception: pass
+    _crumb = ""; _crumb_time = time.time(); return _crumb
 
 def raw(v):
     if isinstance(v, dict) and "raw" in v:
@@ -131,90 +151,75 @@ def yahoo_symbol(symbol):
 
 def yahoo_quote_batch(symbols):
     symbols = [yahoo_symbol(s) for s in symbols if s.strip()]
-    if not symbols:
-        return {}
-    cached_key = "quote_batch_" + "_".join(symbols)
+    if not symbols: return {}
+    cached_key = "quote_batch_" + "_".join(symbols[:10])
     cached = read_cache(cached_key, 120)
-    if cached:
-        return cached
-    crumb = ensure_yahoo_session()
-    fields = ",".join([
-        "symbol","shortName","longName","regularMarketPrice","regularMarketPreviousClose",
-        "regularMarketChangePercent","trailingPE","forwardPE","trailingPegRatio",
-        "priceToBook","marketCap","currency","epsTrailingTwelveMonths","epsForward",
-        "bookValue","fiftyTwoWeekHigh","fiftyTwoWeekLow","regularMarketTime",
-        "trailingAnnualDividendYield","averageDailyVolume3Month","sharesOutstanding",
-        "enterpriseValue","priceToSalesTrailing12Months"
-    ])
-    url = "https://query1.finance.yahoo.com/v7/finance/quote?" + urllib.parse.urlencode({
-        "symbols": ",".join(symbols),
-        "fields": fields,
-        "crumb": crumb
-    })
-    data = get_json(url, timeout=25)
-    results = data.get("quoteResponse", {}).get("result", [])
-    out = {(r.get("symbol") or "").upper(): r for r in results}
-    write_cache(cached_key, out)
-    return out
+    if cached: return cached
+    fields = ",".join(["symbol","shortName","longName","regularMarketPrice","regularMarketPreviousClose",
+        "regularMarketChangePercent","trailingPE","forwardPE","trailingPegRatio","priceToBook",
+        "marketCap","currency","epsTrailingTwelveMonths","epsForward","bookValue",
+        "fiftyTwoWeekHigh","fiftyTwoWeekLow","regularMarketTime","trailingAnnualDividendYield",
+        "sharesOutstanding","enterpriseValue","priceToSalesTrailing12Months"])
+    crumb = ""
+    try: crumb = ensure_yahoo_session()
+    except Exception: pass
+    for host in ["query1", "query2"]:
+        params = {"symbols": ",".join(symbols), "fields": fields}
+        if crumb: params["crumb"] = crumb
+        url = f"https://{host}.finance.yahoo.com/v7/finance/quote?" + urllib.parse.urlencode(params)
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json,*/*", "Accept-Language": "en-US,en;q=0.9", "Referer": "https://finance.yahoo.com/"})
+            with _opener.open(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            results = data.get("quoteResponse", {}).get("result", [])
+            if results:
+                out = {(r.get("symbol") or "").upper(): r for r in results}
+                write_cache(cached_key, out); return out
+        except Exception: pass
+    return {}
 
 def _yahoo_quotesummary_request(symbol, modules, crumb="", timeout=25):
-    """Et quoteSummary-kald med retry på begge query-hosts."""
     for host in ["query2", "query1"]:
         params = {"modules": modules}
         if crumb: params["crumb"] = crumb
         url = (f"https://{host}.finance.yahoo.com/v10/finance/quoteSummary/"
                + urllib.parse.quote(symbol) + "?" + urllib.parse.urlencode(params))
         try:
-            req = urllib.request.Request(url, headers={
-                "User-Agent": UA, "Accept": "application/json,*/*",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Referer": "https://finance.yahoo.com/quote/" + symbol,
-            })
+            req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json,*/*", "Accept-Language": "en-US,en;q=0.9", "Referer": "https://finance.yahoo.com/quote/"+symbol})
             with _opener.open(req, timeout=timeout) as resp:
                 data = json.loads(resp.read().decode("utf-8", errors="replace"))
-            result = (data.get("quoteSummary", {}).get("result") or [None])[0]
-            if result is not None:
+            if (data.get("quoteSummary", {}).get("result") or [None])[0] is not None:
                 return data
-        except Exception:
-            pass
+        except Exception: pass
     return {}
 
 def yahoo_summary(symbol):
-    """Henter quoteSummary i to kald - undgår Yahoo's grænse på ~10 modules ad gangen."""
+    """Split i 2 kald for at undgå Yahoo's module-grænse (~10 modules)."""
     symbol = yahoo_symbol(symbol)
     cached = read_cache("summary_" + symbol, 900)
-    if cached:
-        return cached
+    if cached: return cached
     crumb = ""
     try: crumb = ensure_yahoo_session()
     except Exception: pass
-
-    # Kald 1: score-kritiske moduler (9 stk)
-    mods1 = "price,summaryDetail,defaultKeyStatistics,financialData,earningsTrend,recommendationTrend,assetProfile,upgradeDowngradeHistory,netSharePurchaseActivity"
-    data1 = _yahoo_quotesummary_request(symbol, mods1, crumb, timeout=25)
+    # Kald 1: score-kritiske moduler (9) - price/stats/financials/trends
+    mods1 = "price,summaryDetail,defaultKeyStatistics,financialData,earningsTrend,recommendationTrend,assetProfile,upgradeDowngradeHistory,calendarEvents"
+    data1 = _yahoo_quotesummary_request(symbol, mods1, crumb, 25)
     result1 = (data1.get("quoteSummary", {}).get("result") or [None])[0] or {}
-
-    # Hvis tomt: nulstil crumb og prøv igen
     if not result1:
         global _crumb, _crumb_time
         _crumb = None; _crumb_time = 0
         try: crumb = ensure_yahoo_session()
         except Exception: pass
-        data1 = _yahoo_quotesummary_request(symbol, mods1, crumb, timeout=25)
+        data1 = _yahoo_quotesummary_request(symbol, mods1, crumb, 25)
         result1 = (data1.get("quoteSummary", {}).get("result") or [None])[0] or {}
-
-    # Kald 2: regnskabshistorik (4 moduler)
-    mods2 = "incomeStatementHistory,balanceSheetHistory,cashflowStatementHistory,insiderHolders"
-    data2 = _yahoo_quotesummary_request(symbol, mods2, crumb, timeout=25)
+    # Kald 2: regnskabshistorik (5 moduler)
+    mods2 = "incomeStatementHistory,balanceSheetHistory,cashflowStatementHistory,insiderHolders,netSharePurchaseActivity"
+    data2 = _yahoo_quotesummary_request(symbol, mods2, crumb, 25)
     result2 = (data2.get("quoteSummary", {}).get("result") or [None])[0] or {}
-
-    # Merge: kald 1 vinder ved konflikt
-    merged = {}
-    merged.update(result2)
-    merged.update(result1)
+    # Merge (kald 1 vinder)
+    merged = {}; merged.update(result2); merged.update(result1)
     out = {"quoteSummary": {"result": [merged] if merged else None, "error": None}}
-    if merged:
-        write_cache("summary_" + symbol, out)
+    if merged: write_cache("summary_" + symbol, out)
     return out
 
 def yahoo_news(symbol):
@@ -340,11 +345,12 @@ def yahoo_earnings(symbol):
 
     # ── 1) Yahoo Finance quoteSummary quarterly modules ──────────────
     try:
-        crumb = ""
-        try: crumb = ensure_yahoo_session()
-        except Exception: pass
+        crumb = ensure_yahoo_session()
         modules = "earningsHistory,incomeStatementHistoryQuarterly,balanceSheetHistoryQuarterly,cashflowStatementHistoryQuarterly,earningsTrend"
-        data = _yahoo_quotesummary_request(symbol, modules, crumb, timeout=25)
+        url = ("https://query2.finance.yahoo.com/v10/finance/quoteSummary/"
+               + urllib.parse.quote(symbol) + "?"
+               + urllib.parse.urlencode({"modules": modules, "crumb": crumb}))
+        data = get_json(url, timeout=25)
         qsr = (data.get("quoteSummary", {}).get("result") or [None])[0]
         if qsr:
             # ── EPS history ──────────────────────────────────────────
@@ -612,15 +618,22 @@ def yahoo_earnings(symbol):
 def yahoo_chart(symbol):
     symbol = yahoo_symbol(symbol)
     cached = read_cache("chart_" + symbol, 900)
-    if cached:
-        return cached
-    url = "https://query1.finance.yahoo.com/v8/finance/chart/" + urllib.parse.quote(symbol) + "?" + urllib.parse.urlencode({
-        "range": "1y",
-        "interval": "1d"
-    })
-    data = get_json(url, timeout=25)
-    write_cache("chart_" + symbol, data)
-    return data
+    if cached: return cached
+    crumb = ""
+    try: crumb = ensure_yahoo_session()
+    except Exception: pass
+    params = {"range": "2y", "interval": "1d", "includePrePost": "false"}
+    if crumb: params["crumb"] = crumb
+    for host in ["query1", "query2"]:
+        url = f"https://{host}.finance.yahoo.com/v8/finance/chart/" + urllib.parse.quote(symbol) + "?" + urllib.parse.urlencode(params)
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json,*/*", "Referer": "https://finance.yahoo.com/quote/"+symbol})
+            with _opener.open(req, timeout=25) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            if (data.get("chart",{}).get("result") or [None])[0]:
+                write_cache("chart_" + symbol, data); return data
+        except Exception: pass
+    raise RuntimeError("yahoo_chart fejlede for " + symbol)
 
 def calc_returns_from_chart(chart_data):
     result = (chart_data.get("chart", {}).get("result") or [None])[0]
@@ -913,30 +926,18 @@ def calc_professional_scores(f, pe, peg, roe, rev_growth, m3, m6, m12, price_met
     invested_capital=(debt or 0)+(equity or 0)-(cash or 0) if equity is not None else None
     roic=(ebit/invested_capital) if ebit is not None and invested_capital and invested_capital>0 else None
 
-    # 1) VALUE
-    ps=safe(f.get('priceToSales'))
-    pb=safe(f.get('priceToBook'))
-    ev_ebitda=safe(f.get('evEbitda'))
-    ev_revenue=safe(f.get('evRevenue'))
-
-    # Beregn delscores - None = missing data
-    pe_score = clamp((1/max(pe,1))*1200) if pe and pe>0 else None
-    peg_score = clamp((1/max(peg,0.1))*25*4) if peg and peg>0 else None
-    ps_score = clamp(max(0, 20-ps*2)) if ps is not None and ps>0 else None
-    pb_score = clamp(max(0, 12-pb*1.5)) if pb is not None and pb>0 else None
-    ev_score = clamp(max(0, 16-ev_ebitda*0.75)) if ev_ebitda is not None and ev_ebitda>0 else None
-    evr_score = clamp(max(0, 18-ev_revenue*2.5)) if ev_revenue is not None and ev_revenue>0 else None
-
-    # Vægtet gennemsnit af tilgængelige scores
-    value_parts = [
-        (pe_score, 0.35), (peg_score, 0.15), (ps_score, 0.18),
-        (pb_score, 0.12), (ev_score, 0.12), (evr_score, 0.08),
-    ]
-    available_w = sum(w for v, w in value_parts if v is not None)
-    if available_w > 0:
-        value = clamp(sum(v * w for v, w in value_parts if v is not None) / available_w)
-    else:
-        value = 50  # Ingen data → neutral score (ikke 0)
+    # 1) VALUE — vægtet gennemsnit af tilgængelige multiples
+    ps=safe(f.get('priceToSales')); pb=safe(f.get('priceToBook'))
+    ev_ebitda=safe(f.get('evEbitda')); ev_revenue=safe(f.get('evRevenue'))
+    pe_sc  = clamp((1/max(pe,1))*1200)       if pe   and pe>0   else None
+    peg_sc = clamp((1/max(peg,0.1))*25*4)    if peg  and peg>0  else None
+    ps_sc  = clamp(max(0,20-ps*2))            if ps   and ps>0   else None
+    pb_sc  = clamp(max(0,12-pb*1.5))          if pb   and pb>0   else None
+    ev_sc  = clamp(max(0,16-ev_ebitda*0.75))  if ev_ebitda and ev_ebitda>0 else None
+    evr_sc = clamp(max(0,18-ev_revenue*2.5))  if ev_revenue and ev_revenue>0 else None
+    vparts = [(pe_sc,0.35),(peg_sc,0.15),(ps_sc,0.18),(pb_sc,0.12),(ev_sc,0.12),(evr_sc,0.08)]
+    aw = sum(w for v,w in vparts if v is not None)
+    value = clamp(sum(v*w for v,w in vparts if v is not None)/aw) if aw>0 else 50
 
     # 2) EARNINGS QUALITY
     accrual_ratio = ((net_income or 0) - (op_cf or 0)) / total_assets if total_assets and net_income is not None and op_cf is not None else None
@@ -1209,29 +1210,23 @@ def build_stock(symbol, quote=None):
     pe = quote.get("trailingPE")
     peg = quote.get("trailingPegRatio")
     roe = None; rev_growth = None
-    # Forhåndsudtræk fra quote-batch (hurtig kilde, ingen ekstra request)
-    _q_pb    = quote.get("priceToBook")
-    _q_ps    = quote.get("priceToSalesTrailing12Months")
-    _q_ev    = quote.get("enterpriseValue")
-    _q_fpe   = quote.get("forwardPE")
-    _q_eps_t = quote.get("epsTrailingTwelveMonths")
-    _q_eps_f = quote.get("epsForward")
-    _q_bv    = quote.get("bookValue")
-    _q_sh    = quote.get("sharesOutstanding")
-    _q_div   = quote.get("trailingAnnualDividendYield")
-    # Beregn EV/Sales og P/S fra quote-data
-    _q_mktcap = quote.get("marketCap")
-    _q_price  = quote.get("regularMarketPrice")
-    # Extended financials - start med quote-batch data som fallback
+    _q_pb  = quote.get("priceToBook"); _q_ps = quote.get("priceToSalesTrailing12Months")
+    _q_ev  = quote.get("enterpriseValue"); _q_fpe = quote.get("forwardPE")
+    _q_bv  = quote.get("bookValue"); _q_sh = quote.get("sharesOutstanding")
+    _q_div = quote.get("trailingAnnualDividendYield"); _q_mktcap = quote.get("marketCap")
+    _q_eps_t = quote.get("epsTrailingTwelveMonths"); _q_eps_f = quote.get("epsForward")
+    # Pre-populate fin_ext med quote-batch data som fallback
     fin_ext = {}
-    if _q_pb is not None: fin_ext["priceToBook"] = _q_pb
-    if _q_ps is not None: fin_ext["priceToSales"] = _q_ps
-    if _q_ev is not None: fin_ext["enterpriseValue"] = _q_ev
-    if _q_fpe is not None: fin_ext["forwardPE"] = _q_fpe
-    if _q_bv is not None: fin_ext["bookValue"] = _q_bv
-    if _q_sh is not None: fin_ext["sharesOutstanding"] = _q_sh
-    if _q_div is not None: fin_ext["dividendYield"] = _q_div
-    if _q_mktcap is not None: fin_ext["marketCap"] = _q_mktcap
+    if _q_pb:    fin_ext["priceToBook"]    = _q_pb
+    if _q_ps:    fin_ext["priceToSales"]   = _q_ps
+    if _q_ev:    fin_ext["enterpriseValue"]= _q_ev
+    if _q_fpe:   fin_ext["forwardPE"]      = _q_fpe
+    if _q_bv:    fin_ext["bookValue"]      = _q_bv
+    if _q_sh:    fin_ext["sharesOutstanding"] = _q_sh
+    if _q_div:   fin_ext["dividendYield"]  = _q_div
+    if _q_mktcap:fin_ext["marketCap"]      = _q_mktcap
+    if _q_eps_t: fin_ext["epsTrailing"]    = _q_eps_t
+    if _q_eps_f: fin_ext["epsForward"]     = _q_eps_f
     try:
         summary = yahoo_summary(symbol)
         result = (summary.get("quoteSummary", {}).get("result") or [None])[0]
@@ -1408,6 +1403,19 @@ def build_stock(symbol, quote=None):
                     "fromGrade": u.get("fromGrade",""),
                 }
 
+            # ── Calendar Events → daysToEarnings ─────────────────
+            cal_ev = result.get("calendarEvents", {})
+            earn_date_obj = (cal_ev.get("earnings") or {}).get("earningsDate") or []
+            if earn_date_obj:
+                try:
+                    import time as _t
+                    next_earn_raw = earn_date_obj[0]
+                    next_earn_ts = raw(next_earn_raw) if isinstance(next_earn_raw, dict) else next_earn_raw
+                    if next_earn_ts:
+                        days_left = max(0, round((float(next_earn_ts) - _t.time()) / 86400))
+                        fin_ext["daysToEarnings"] = days_left
+                except Exception: pass
+
             # ── Earnings trend / revisions ────────────────────────
             trend_items = (earn_trend.get("trend") or [])
             eps_est_next_q = None
@@ -1538,6 +1546,73 @@ def build_stock(symbol, quote=None):
         price_metrics = {}
 
     value, quality, momentum, total = score_components(pe, peg, roe, rev_growth, m3, m6, m12)
+    # ── Derived fields: estimer absolutte tal fra relative hvis statement-modules mangler ──
+    _rev   = fin_ext.get("totalRevenue")
+    _sh2   = fin_ext.get("sharesOutstanding") or (_q_sh if "_q_sh" in dir() else None)
+    _rps   = fin_ext.get("revenuePerShare")
+    _mktc  = fin_ext.get("marketCap")
+    _ev2   = fin_ext.get("enterpriseValue")
+    _bv2   = fin_ext.get("bookValue")
+    _pb2   = fin_ext.get("priceToBook")
+    _cash2 = fin_ext.get("cashAndEquivalents")
+
+    if _rev is None and _rps and _sh2:
+        _rev = _rps * _sh2; fin_ext["totalRevenue"] = _rev
+
+    if _rev:
+        if fin_ext.get("grossProfit") is None and fin_ext.get("grossMargin") is not None:
+            fin_ext["grossProfit"] = _rev * fin_ext["grossMargin"]
+        if fin_ext.get("ebit") is None:
+            _om = fin_ext.get("operatingMargin") or fin_ext.get("ebitMargin")
+            if _om: fin_ext["ebit"] = _rev * _om
+        if fin_ext.get("netIncome") is None:
+            _pm = fin_ext.get("netMargin") or fin_ext.get("profitMargins")
+            if _pm: fin_ext["netIncome"] = _rev * _pm
+        if fin_ext.get("ebitda") is None and fin_ext.get("ebitdaMargin") is not None:
+            fin_ext["ebitda"] = _rev * fin_ext["ebitdaMargin"]
+
+    if fin_ext.get("stockholderEquity") is None:
+        if _bv2 and _sh2: fin_ext["stockholderEquity"] = _bv2 * _sh2
+        elif _pb2 and _mktc and _pb2 > 0: fin_ext["stockholderEquity"] = _mktc / _pb2
+
+    if fin_ext.get("totalDebt") is None and _ev2 and _mktc:
+        _d = _ev2 - _mktc + (_cash2 or 0)
+        if _d >= 0: fin_ext["totalDebt"] = _d
+
+    if fin_ext.get("totalAssets") is None:
+        _eq = fin_ext.get("stockholderEquity"); _td = fin_ext.get("totalDebt")
+        if _eq is not None and _td is not None: fin_ext["totalAssets"] = _eq + _td
+
+    if fin_ext.get("netDebt") is None:
+        _td2 = fin_ext.get("totalDebt"); _ca2 = fin_ext.get("cashAndEquivalents")
+        if _td2 is not None and _ca2 is not None: fin_ext["netDebt"] = _td2 - _ca2
+
+    if fin_ext.get("netDebtEbitda") is None:
+        _nd = fin_ext.get("netDebt"); _eb = fin_ext.get("ebitda")
+        if _nd is not None and _eb and _eb != 0: fin_ext["netDebtEbitda"] = _nd / _eb
+
+    if fin_ext.get("altmanZ") is None:
+        _ta3 = fin_ext.get("totalAssets")
+        if _ta3 and _ta3 != 0:
+            try:
+                _wc = (_cash2 or 0) - (fin_ext.get("totalDebt") or 0)*0.3
+                fin_ext["altmanZ"] = round(1.2*(_wc/_ta3)+1.4*((fin_ext.get("netIncome") or 0)/_ta3)+3.3*((fin_ext.get("ebit") or 0)/_ta3)+0.6*((_mktc or 0)/(fin_ext.get("totalDebt") or 1))+1.0*((fin_ext.get("totalRevenue") or 0)/_ta3),2)
+            except Exception: pass
+
+    if fin_ext.get("piotroskiF") is None:
+        _pf=0
+        _pf += 1 if (fin_ext.get("netIncome") or 0) > 0 else 0
+        _pf += 1 if (fin_ext.get("operatingCashflow") or 0) > 0 else 0
+        _pf += 1 if (fin_ext.get("roa") or 0) > 0 else 0
+        _pf += 1 if (fin_ext.get("operatingCashflow") or 0) > (fin_ext.get("netIncome") or 0) else 0
+        _pf += 1 if (fin_ext.get("debtToEquity") or 999) < 100 else 0
+        _pf += 1 if (fin_ext.get("currentRatio") or 0) > 1 else 0
+        _pf += 1 if (fin_ext.get("grossMargin") or 0) > 0.25 else 0
+        _pf += 1 if (fin_ext.get("operatingMargin") or 0) > 0.08 else 0
+        _pf += 1 if (fin_ext.get("revenueGrowth") or roe or 0) > 0 else 0
+        if any(fin_ext.get(k) is not None for k in ("netIncome","operatingCashflow","roa","grossMargin")):
+            fin_ext["piotroskiF"] = _pf
+
     fin_ext["price"] = price
     pro_scores = calc_professional_scores(fin_ext, pe, peg, roe, rev_growth, m3, m6, m12, price_metrics)
     value, quality, momentum, total = pro_scores["value"], pro_scores["quality"], pro_scores["momentum"], pro_scores["total"]
@@ -2560,20 +2635,33 @@ def _chart_arrays(symbol, chart_range="2y"):
     symbol = yahoo_symbol(symbol)
     cached = read_cache("breakout_chart_" + symbol + "_" + chart_range, 300)
     if cached: return cached
-    url = "https://query1.finance.yahoo.com/v8/finance/chart/" + urllib.parse.quote(symbol) + "?" + urllib.parse.urlencode({"range": chart_range, "interval":"1d"})
-    data = get_json(url, timeout=25)
+    crumb = ""
+    try: crumb = ensure_yahoo_session()
+    except Exception: pass
+    params = {"range": chart_range, "interval": "1d", "includePrePost": "false"}
+    if crumb: params["crumb"] = crumb
+    data = None
+    for host in ["query1", "query2"]:
+        url = f"https://{host}.finance.yahoo.com/v8/finance/chart/" + urllib.parse.quote(symbol) + "?" + urllib.parse.urlencode(params)
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json,*/*", "Referer": "https://finance.yahoo.com/quote/"+symbol})
+            with _opener.open(req, timeout=12) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            if (data.get("chart",{}).get("result") or [None])[0]: break
+        except Exception: data = None
+    if not data: raise RuntimeError("Ingen chart data for " + symbol)
     result = (data.get("chart",{}).get("result") or [None])[0]
-    if not result: raise RuntimeError("Ingen Yahoo chart data")
+    if not result: raise RuntimeError("Ingen chart data for " + symbol)
     q = (result.get("indicators",{}).get("quote") or [{}])[0]
     ts = result.get("timestamp") or []
-    out=[]
+    out = []
     for i,t in enumerate(ts):
         try:
             c=q.get("close",[])[i]; h=q.get("high",[])[i]; l=q.get("low",[])[i]; o=q.get("open",[])[i]; v=q.get("volume",[])[i]
             if c is None or h is None or l is None: continue
             out.append({"t":t,"open":_num(o,c),"high":_num(h),"low":_num(l),"close":_num(c),"volume":_num(v,0)})
         except Exception: pass
-    if len(out) < 20: raise RuntimeError("For lidt historik til breakout score")
+    if len(out) < 20: raise RuntimeError("For lidt historik til breakout for " + symbol)
     write_cache("breakout_chart_" + symbol + "_" + chart_range, out)
     return out
 
@@ -2788,17 +2876,25 @@ def breakout_single_ticker_mlflow(symbol):
     return {"ok": True, "result": row, "logs": logs}
 
 def breakout_scan_symbols(symbols, limit=80):
-    symbols=[yahoo_symbol(s) for s in symbols if str(s).strip()]
-    quotes={}
-    try: quotes=yahoo_quote_batch(symbols)
+    symbols = [yahoo_symbol(s) for s in symbols if str(s).strip()]
+    quotes = {}
+    try: quotes = yahoo_quote_batch(symbols)
     except Exception: pass
-    rows=[]
-    for s in symbols[:limit]:
-        try: rows.append(breakout_score_symbol(s, quotes.get(yahoo_symbol(s),{})))
-        except Exception as e: rows.append({"ticker": yahoo_symbol(s), "ok": False, "error": str(e), "score":0, "signal":"ERROR"})
-    rows=[r for r in rows if r.get("ok", True) is not False]
-    rows.sort(key=lambda x: x.get("score",0), reverse=True)
+    rows = []
+    import concurrent.futures
+    def _score_one(s):
+        try: return breakout_score_symbol(s, quotes.get(s, {}))
+        except Exception as e: return {"ticker": s, "ok": False, "error": str(e), "score": 0, "signal": "ERROR"}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+        futures = {ex.submit(_score_one, s): s for s in symbols[:limit]}
+        for fut in concurrent.futures.as_completed(futures, timeout=120):
+            try: rows.append(fut.result(timeout=18))
+            except Exception as e:
+                rows.append({"ticker": futures[fut], "ok": False, "error": str(e), "score": 0, "signal": "ERROR"})
+    rows = [r for r in rows if r.get("ok", True) is not False]
+    rows.sort(key=lambda x: x.get("score", 0), reverse=True)
     return rows
+
 
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
@@ -3018,11 +3114,15 @@ class Handler(SimpleHTTPRequestHandler):
                 label = "Custom"
             else:
                 symbols, label = get_breakout_scan_universe(universe, smallcap_limit=smallcap_limit)
+            limit = min(limit, 20)
             try:
-                rows = breakout_scan_symbols(symbols, limit=limit)
+                import concurrent.futures as _cf2
+                _fut = _cf2.ThreadPoolExecutor(max_workers=1).submit(breakout_scan_symbols, symbols, limit)
+                try: rows = _fut.result(timeout=50)
+                except _cf2.TimeoutError: rows = []
                 return self.json_response({"ok": True, "universe": label, "sourceCount": len(symbols), "count": len(rows), "results": rows})
             except Exception as e:
-                return self.json_response({"ok": False, "error": str(e)}, 502)
+                return self.json_response({"ok": False, "error": str(e)}, 200)
 
         if parsed.path == "/api/backtest":
             symbol = qs.get("symbol", [""])[0].strip()
@@ -3043,6 +3143,16 @@ class Handler(SimpleHTTPRequestHandler):
                 "source": "Yahoo Finance crumb/session", "batchSize": MAX_BATCH_SYMBOLS,
                 "workers": BATCH_WORKERS, "version": "stock-pro-10x-v10.4-split-screener-breakout-universes"
             })
+
+        if parsed.path == "/api/debug-session":
+            info = {"crumb_set": bool(_crumb), "crumb_age_sec": int(time.time()-_crumb_time) if _crumb_time else None}
+            try: crumb_t = ensure_yahoo_session(); info["session_ok"] = True; info["crumb_preview"] = (crumb_t[:8]+"...") if crumb_t else "(tom)"
+            except Exception as e: info["session_ok"] = False; info["session_error"] = str(e)
+            try:
+                q = yahoo_quote_batch(["AAPL"]); aapl = q.get("AAPL", {})
+                info["quote_test"] = {"ok": bool(aapl), "price": aapl.get("regularMarketPrice"), "pb": aapl.get("priceToBook")}
+            except Exception as e: info["quote_test"] = {"ok": False, "error": str(e)}
+            return self.json_response(info)
         if parsed.path == "/api/yahoo-test":
             try:
                 ensure_yahoo_session()
