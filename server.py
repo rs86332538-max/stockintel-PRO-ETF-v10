@@ -101,31 +101,8 @@ def http_get(url, timeout=25, accept="application/json,text/plain,*/*"):
         return resp.status, resp.read().decode("utf-8", errors="replace")
 
 def get_json(url, timeout=25):
-    try:
-        req = urllib.request.Request(url, headers={
-            "User-Agent": UA,
-            "Accept": "application/json,text/plain,*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://finance.yahoo.com/",
-            "Connection": "keep-alive",
-        })
-        with _opener.open(req, timeout=timeout) as resp:
-            txt = resp.read().decode("utf-8", errors="replace")
-            return json.loads(txt)
-    except Exception:
-        # Fallback: prøv den anden query-host hvis URL indeholder query1/query2
-        alt = url.replace("query1.finance.yahoo.com", "query2.finance.yahoo.com") if "query1" in url else url.replace("query2.finance.yahoo.com", "query1.finance.yahoo.com")
-        if alt != url:
-            req2 = urllib.request.Request(alt, headers={
-                "User-Agent": UA,
-                "Accept": "application/json,text/plain,*/*",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Referer": "https://finance.yahoo.com/",
-            })
-            with _opener.open(req2, timeout=timeout) as resp2:
-                txt2 = resp2.read().decode("utf-8", errors="replace")
-                return json.loads(txt2)
-        raise
+    status, txt = http_get(url, timeout=timeout)
+    return json.loads(txt)
 
 def ensure_yahoo_session():
     global _crumb, _crumb_time
@@ -163,8 +140,11 @@ def yahoo_quote_batch(symbols):
     crumb = ensure_yahoo_session()
     fields = ",".join([
         "symbol","shortName","longName","regularMarketPrice","regularMarketPreviousClose",
-        "regularMarketChangePercent","trailingPE","forwardPE","marketCap","currency",
-        "fiftyTwoWeekHigh","fiftyTwoWeekLow","regularMarketTime","marketCap"
+        "regularMarketChangePercent","trailingPE","forwardPE","trailingPegRatio",
+        "priceToBook","marketCap","currency","epsTrailingTwelveMonths","epsForward",
+        "bookValue","fiftyTwoWeekHigh","fiftyTwoWeekLow","regularMarketTime",
+        "trailingAnnualDividendYield","averageDailyVolume3Month","sharesOutstanding",
+        "enterpriseValue","priceToSalesTrailing12Months"
     ])
     url = "https://query1.finance.yahoo.com/v7/finance/quote?" + urllib.parse.urlencode({
         "symbols": ",".join(symbols),
@@ -177,21 +157,65 @@ def yahoo_quote_batch(symbols):
     write_cache(cached_key, out)
     return out
 
+def _yahoo_quotesummary_request(symbol, modules, crumb="", timeout=25):
+    """Et quoteSummary-kald med retry på begge query-hosts."""
+    for host in ["query2", "query1"]:
+        params = {"modules": modules}
+        if crumb: params["crumb"] = crumb
+        url = (f"https://{host}.finance.yahoo.com/v10/finance/quoteSummary/"
+               + urllib.parse.quote(symbol) + "?" + urllib.parse.urlencode(params))
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": UA, "Accept": "application/json,*/*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://finance.yahoo.com/quote/" + symbol,
+            })
+            with _opener.open(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            result = (data.get("quoteSummary", {}).get("result") or [None])[0]
+            if result is not None:
+                return data
+        except Exception:
+            pass
+    return {}
+
 def yahoo_summary(symbol):
+    """Henter quoteSummary i to kald - undgår Yahoo's grænse på ~10 modules ad gangen."""
     symbol = yahoo_symbol(symbol)
     cached = read_cache("summary_" + symbol, 900)
     if cached:
         return cached
-    crumb = ensure_yahoo_session()
-    modules = "price,summaryDetail,defaultKeyStatistics,financialData,incomeStatementHistory,balanceSheetHistory,cashflowStatementHistory,earningsTrend,recommendationTrend,upgradeDowngradeHistory,assetProfile,insiderHolders,insiderTransactions,netSharePurchaseActivity"
-    url = "https://query2.finance.yahoo.com/v10/finance/quoteSummary/" + urllib.parse.quote(symbol) + "?" + urllib.parse.urlencode({
-        "modules": modules,
-        "crumb": crumb
-    })
-    data = get_json(url, timeout=30)
-    write_cache("summary_" + symbol, data)
-    return data
+    crumb = ""
+    try: crumb = ensure_yahoo_session()
+    except Exception: pass
 
+    # Kald 1: score-kritiske moduler (9 stk)
+    mods1 = "price,summaryDetail,defaultKeyStatistics,financialData,earningsTrend,recommendationTrend,assetProfile,upgradeDowngradeHistory,netSharePurchaseActivity"
+    data1 = _yahoo_quotesummary_request(symbol, mods1, crumb, timeout=25)
+    result1 = (data1.get("quoteSummary", {}).get("result") or [None])[0] or {}
+
+    # Hvis tomt: nulstil crumb og prøv igen
+    if not result1:
+        global _crumb, _crumb_time
+        _crumb = None; _crumb_time = 0
+        try: crumb = ensure_yahoo_session()
+        except Exception: pass
+        data1 = _yahoo_quotesummary_request(symbol, mods1, crumb, timeout=25)
+        result1 = (data1.get("quoteSummary", {}).get("result") or [None])[0] or {}
+
+    # Kald 2: regnskabshistorik (4 moduler)
+    mods2 = "incomeStatementHistory,balanceSheetHistory,cashflowStatementHistory,insiderHolders"
+    data2 = _yahoo_quotesummary_request(symbol, mods2, crumb, timeout=25)
+    result2 = (data2.get("quoteSummary", {}).get("result") or [None])[0] or {}
+
+    # Merge: kald 1 vinder ved konflikt
+    merged = {}
+    merged.update(result2)
+    merged.update(result1)
+    out = {"quoteSummary": {"result": [merged] if merged else None, "error": None}}
+    if merged:
+        write_cache("summary_" + symbol, out)
+    return out
 
 def yahoo_news(symbol):
     """Fetch news from Yahoo Finance RSS and Finviz."""
@@ -316,12 +340,11 @@ def yahoo_earnings(symbol):
 
     # ── 1) Yahoo Finance quoteSummary quarterly modules ──────────────
     try:
-        crumb = ensure_yahoo_session()
+        crumb = ""
+        try: crumb = ensure_yahoo_session()
+        except Exception: pass
         modules = "earningsHistory,incomeStatementHistoryQuarterly,balanceSheetHistoryQuarterly,cashflowStatementHistoryQuarterly,earningsTrend"
-        url = ("https://query2.finance.yahoo.com/v10/finance/quoteSummary/"
-               + urllib.parse.quote(symbol) + "?"
-               + urllib.parse.urlencode({"modules": modules, "crumb": crumb}))
-        data = get_json(url, timeout=25)
+        data = _yahoo_quotesummary_request(symbol, modules, crumb, timeout=25)
         qsr = (data.get("quoteSummary", {}).get("result") or [None])[0]
         if qsr:
             # ── EPS history ──────────────────────────────────────────
@@ -591,30 +614,13 @@ def yahoo_chart(symbol):
     cached = read_cache("chart_" + symbol, 900)
     if cached:
         return cached
-    crumb = ""
-    try: crumb = ensure_yahoo_session()
-    except Exception: pass
-    params = {"range": "2y", "interval": "1d", "includePrePost": "false"}
-    if crumb: params["crumb"] = crumb
-    last_err = None
-    for host in ["query1", "query2"]:
-        url = f"https://{host}.finance.yahoo.com/v8/finance/chart/" + urllib.parse.quote(symbol) + "?" + urllib.parse.urlencode(params)
-        try:
-            req = urllib.request.Request(url, headers={
-                "User-Agent": UA,
-                "Accept": "application/json,*/*",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Referer": "https://finance.yahoo.com/quote/" + symbol,
-            })
-            with _opener.open(req, timeout=25) as resp:
-                data = json.loads(resp.read().decode("utf-8", errors="replace"))
-            result = (data.get("chart",{}).get("result") or [None])[0]
-            if result:
-                write_cache("chart_" + symbol, data)
-                return data
-        except Exception as e:
-            last_err = e
-    raise last_err or RuntimeError("yahoo_chart fejlede for " + symbol)
+    url = "https://query1.finance.yahoo.com/v8/finance/chart/" + urllib.parse.quote(symbol) + "?" + urllib.parse.urlencode({
+        "range": "1y",
+        "interval": "1d"
+    })
+    data = get_json(url, timeout=25)
+    write_cache("chart_" + symbol, data)
+    return data
 
 def calc_returns_from_chart(chart_data):
     result = (chart_data.get("chart", {}).get("result") or [None])[0]
@@ -908,16 +914,29 @@ def calc_professional_scores(f, pe, peg, roe, rev_growth, m3, m6, m12, price_met
     roic=(ebit/invested_capital) if ebit is not None and invested_capital and invested_capital>0 else None
 
     # 1) VALUE
-    value=0
-    if pe and pe>0: value += (1/max(pe,1))*1200
-    if peg and peg>0: value += (1/max(peg,0.1))*25
     ps=safe(f.get('priceToSales'))
     pb=safe(f.get('priceToBook'))
     ev_ebitda=safe(f.get('evEbitda'))
-    if ps is not None: value += max(0, 20-ps*2)
-    if pb is not None: value += max(0, 12-pb*1.5)
-    if ev_ebitda is not None and ev_ebitda>0: value += max(0, 16-ev_ebitda*0.75)
-    value=clamp(value)
+    ev_revenue=safe(f.get('evRevenue'))
+
+    # Beregn delscores - None = missing data
+    pe_score = clamp((1/max(pe,1))*1200) if pe and pe>0 else None
+    peg_score = clamp((1/max(peg,0.1))*25*4) if peg and peg>0 else None
+    ps_score = clamp(max(0, 20-ps*2)) if ps is not None and ps>0 else None
+    pb_score = clamp(max(0, 12-pb*1.5)) if pb is not None and pb>0 else None
+    ev_score = clamp(max(0, 16-ev_ebitda*0.75)) if ev_ebitda is not None and ev_ebitda>0 else None
+    evr_score = clamp(max(0, 18-ev_revenue*2.5)) if ev_revenue is not None and ev_revenue>0 else None
+
+    # Vægtet gennemsnit af tilgængelige scores
+    value_parts = [
+        (pe_score, 0.35), (peg_score, 0.15), (ps_score, 0.18),
+        (pb_score, 0.12), (ev_score, 0.12), (evr_score, 0.08),
+    ]
+    available_w = sum(w for v, w in value_parts if v is not None)
+    if available_w > 0:
+        value = clamp(sum(v * w for v, w in value_parts if v is not None) / available_w)
+    else:
+        value = 50  # Ingen data → neutral score (ikke 0)
 
     # 2) EARNINGS QUALITY
     accrual_ratio = ((net_income or 0) - (op_cf or 0)) / total_assets if total_assets and net_income is not None and op_cf is not None else None
@@ -1188,9 +1207,31 @@ def build_stock(symbol, quote=None):
     company = quote.get("longName") or quote.get("shortName") or symbol
     price = quote.get("regularMarketPrice")
     pe = quote.get("trailingPE")
-    peg = None; roe = None; rev_growth = None
-    # Extended financials
+    peg = quote.get("trailingPegRatio")
+    roe = None; rev_growth = None
+    # Forhåndsudtræk fra quote-batch (hurtig kilde, ingen ekstra request)
+    _q_pb    = quote.get("priceToBook")
+    _q_ps    = quote.get("priceToSalesTrailing12Months")
+    _q_ev    = quote.get("enterpriseValue")
+    _q_fpe   = quote.get("forwardPE")
+    _q_eps_t = quote.get("epsTrailingTwelveMonths")
+    _q_eps_f = quote.get("epsForward")
+    _q_bv    = quote.get("bookValue")
+    _q_sh    = quote.get("sharesOutstanding")
+    _q_div   = quote.get("trailingAnnualDividendYield")
+    # Beregn EV/Sales og P/S fra quote-data
+    _q_mktcap = quote.get("marketCap")
+    _q_price  = quote.get("regularMarketPrice")
+    # Extended financials - start med quote-batch data som fallback
     fin_ext = {}
+    if _q_pb is not None: fin_ext["priceToBook"] = _q_pb
+    if _q_ps is not None: fin_ext["priceToSales"] = _q_ps
+    if _q_ev is not None: fin_ext["enterpriseValue"] = _q_ev
+    if _q_fpe is not None: fin_ext["forwardPE"] = _q_fpe
+    if _q_bv is not None: fin_ext["bookValue"] = _q_bv
+    if _q_sh is not None: fin_ext["sharesOutstanding"] = _q_sh
+    if _q_div is not None: fin_ext["dividendYield"] = _q_div
+    if _q_mktcap is not None: fin_ext["marketCap"] = _q_mktcap
     try:
         summary = yahoo_summary(symbol)
         result = (summary.get("quoteSummary", {}).get("result") or [None])[0]
@@ -2519,34 +2560,10 @@ def _chart_arrays(symbol, chart_range="2y"):
     symbol = yahoo_symbol(symbol)
     cached = read_cache("breakout_chart_" + symbol + "_" + chart_range, 300)
     if cached: return cached
-    crumb = ""
-    try: crumb = ensure_yahoo_session()
-    except Exception: pass
-    params = {"range": chart_range, "interval": "1d", "includePrePost": "false"}
-    if crumb: params["crumb"] = crumb
-    data = None
-    last_err = None
-    for host in ["query1", "query2"]:
-        url = f"https://{host}.finance.yahoo.com/v8/finance/chart/" + urllib.parse.quote(symbol) + "?" + urllib.parse.urlencode(params)
-        try:
-            req = urllib.request.Request(url, headers={
-                "User-Agent": UA,
-                "Accept": "application/json,*/*",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Referer": "https://finance.yahoo.com/quote/" + symbol,
-            })
-            with _opener.open(req, timeout=12) as resp:
-                data = json.loads(resp.read().decode("utf-8", errors="replace"))
-            result = (data.get("chart",{}).get("result") or [None])[0]
-            if result:
-                break
-        except Exception as e:
-            last_err = e
-            data = None
-    if not data:
-        raise last_err or RuntimeError("Ingen Yahoo chart data for " + symbol)
+    url = "https://query1.finance.yahoo.com/v8/finance/chart/" + urllib.parse.quote(symbol) + "?" + urllib.parse.urlencode({"range": chart_range, "interval":"1d"})
+    data = get_json(url, timeout=25)
     result = (data.get("chart",{}).get("result") or [None])[0]
-    if not result: raise RuntimeError("Ingen Yahoo chart data for " + symbol)
+    if not result: raise RuntimeError("Ingen Yahoo chart data")
     q = (result.get("indicators",{}).get("quote") or [{}])[0]
     ts = result.get("timestamp") or []
     out=[]
@@ -2556,7 +2573,7 @@ def _chart_arrays(symbol, chart_range="2y"):
             if c is None or h is None or l is None: continue
             out.append({"t":t,"open":_num(o,c),"high":_num(h),"low":_num(l),"close":_num(c),"volume":_num(v,0)})
         except Exception: pass
-    if len(out) < 20: raise RuntimeError("For lidt historik til breakout score for " + symbol)
+    if len(out) < 20: raise RuntimeError("For lidt historik til breakout score")
     write_cache("breakout_chart_" + symbol + "_" + chart_range, out)
     return out
 
@@ -2776,22 +2793,9 @@ def breakout_scan_symbols(symbols, limit=80):
     try: quotes=yahoo_quote_batch(symbols)
     except Exception: pass
     rows=[]
-    import concurrent.futures
-    def _score_one(s):
-        try:
-            return breakout_score_symbol(s, quotes.get(s, {}))
-        except Exception as e:
-            return {"ticker": s, "ok": False, "error": str(e), "score": 0, "signal": "ERROR"}
-    # Parallel hentning - max 4 workers, 18 sek timeout per ticker
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
-        futures = {ex.submit(_score_one, s): s for s in symbols[:limit]}
-        for fut in concurrent.futures.as_completed(futures, timeout=120):
-            try:
-                row = fut.result(timeout=18)
-                rows.append(row)
-            except Exception as e:
-                s = futures[fut]
-                rows.append({"ticker": s, "ok": False, "error": str(e), "score": 0, "signal": "ERROR"})
+    for s in symbols[:limit]:
+        try: rows.append(breakout_score_symbol(s, quotes.get(yahoo_symbol(s),{})))
+        except Exception as e: rows.append({"ticker": yahoo_symbol(s), "ok": False, "error": str(e), "score":0, "signal":"ERROR"})
     rows=[r for r in rows if r.get("ok", True) is not False]
     rows.sort(key=lambda x: x.get("score",0), reverse=True)
     return rows
@@ -3014,18 +3018,11 @@ class Handler(SimpleHTTPRequestHandler):
                 label = "Custom"
             else:
                 symbols, label = get_breakout_scan_universe(universe, smallcap_limit=smallcap_limit)
-            # Cap batch til 20 tickers fra URL-parameteren, sæt hård timeout
-            limit = min(limit, 20)
             try:
-                import concurrent.futures as _cf
-                fut = _cf.ThreadPoolExecutor(max_workers=1).submit(breakout_scan_symbols, symbols, limit)
-                try:
-                    rows = fut.result(timeout=50)  # 50 sek max - under Renders 60 sek proxy timeout
-                except _cf.TimeoutError:
-                    rows = []
+                rows = breakout_scan_symbols(symbols, limit=limit)
                 return self.json_response({"ok": True, "universe": label, "sourceCount": len(symbols), "count": len(rows), "results": rows})
             except Exception as e:
-                return self.json_response({"ok": False, "error": str(e)}, 200)
+                return self.json_response({"ok": False, "error": str(e)}, 502)
 
         if parsed.path == "/api/backtest":
             symbol = qs.get("symbol", [""])[0].strip()
