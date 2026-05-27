@@ -1,0 +1,124 @@
+# STOCK PRO 10X — Online på 10 minutter
+# Brug Render.com (gratis, ingen kreditkort)
+
+====================================================
+TRIN 1 — Pak filerne sammen
+====================================================
+
+Læg ALLE disse filer i ÉN mappe på din computer:
+
+  ✓ auth_server.py     (ny - erstatter server.py som startpunkt)
+  ✓ server.py          (original - behold uændret)
+  ✓ etf_core.py        (original)
+  ✓ xtrackers_data.py  (original)
+  ✓ etf-database.json  (original)
+  ✓ index.html         (original)
+  ✓ etf.html           (original)
+  ✓ login.html         (ny)
+  ✓ requirements.txt   (ny)
+  ✓ Procfile           (ny)
+
+====================================================
+TRIN 2 — Opret GitHub-konto (gratis)
+====================================================
+
+1. Gå til: https://github.com
+2. Klik "Sign up" — opret gratis konto
+3. Bekræft din email
+
+====================================================
+TRIN 3 — Upload filerne til GitHub
+====================================================
+
+1. Log ind på GitHub
+2. Klik det GRØNNE knap "New" (øverst til venstre)
+3. Under "Repository name": skriv  stockpro
+4. Vælg "Private"  ← VIGTIGT (så koden ikke er offentlig)
+5. Klik "Create repository"
+
+Nu er du på en tom side. Du ser teksten "uploading an existing file":
+6. Klik på det link
+7. DRAG filerne fra din computer ind i browservinduet
+8. Klik den grønne knap "Commit changes"
+
+====================================================
+TRIN 4 — Opret Render-konto (gratis)
+====================================================
+
+1. Gå til: https://render.com
+2. Klik "Get Started for Free"
+3. Klik "Continue with GitHub" — log ind med din GitHub-konto
+4. Giv Render adgang til dine repositories
+
+====================================================
+TRIN 5 — Deploy på Render
+====================================================
+
+1. På Render: klik "New +" → vælg "Web Service"
+2. Klik "Connect" ud for dit "stockpro" repository
+3. Udfyld formularen:
+   - Name:             stockpro  (eller hvad du vil)
+   - Region:           Frankfurt (EU) eller nærmeste
+   - Branch:           main
+   - Runtime:          Python 3
+   - Build Command:    pip install -r requirements.txt
+   - Start Command:    python auth_server.py
+   - Instance Type:    Free
+4. Klik "Create Web Service"
+
+Render bygger nu appen — det tager 2-3 minutter.
+
+====================================================
+TRIN 6 — Sæt dit brugernavn og adgangskode
+====================================================
+
+1. Klik på "Environment" i menuen til venstre
+2. Klik "Add Environment Variable" for HVER af disse:
+
+   Key: APP_USERNAME    Value: (dit valgte brugernavn, fx: thomas)
+   Key: APP_PASSWORD    Value: (din adgangskode, fx: MinKode123!)
+   Key: SECRET_KEY      Value: (skriv en lang tilfældig streng, fx: xK9mP2qR7nVw8aB3)
+
+3. Klik "Save Changes"
+   → Render genstarter automatisk med de nye indstillinger
+
+====================================================
+TRIN 7 — Find din URL og log ind
+====================================================
+
+Øverst på siden ser du din URL:
+  https://stockpro-xxxx.onrender.com
+
+Åbn den i din browser.
+Du ser login-siden → log ind med dit brugernavn + adgangskode.
+
+LOG UD: Gå til:  https://din-url.onrender.com/logout
+
+====================================================
+VIGTIGT — Gratis plan sover efter 15 min inaktivitet
+====================================================
+
+På Render's gratis plan "sover" appen efter 15 minutter
+uden besøg. Første gang du åbner siden bagefter tager
+det ~30 sekunder at vågne op — det er normalt.
+
+Vil du undgå dette:
+- Opgrader til Render Starter ($7/md)
+- Eller brug UptimeRobot.com (gratis) til at pinge
+  din URL hvert 10. minut
+
+====================================================
+FEJLFINDING
+====================================================
+
+Siden virker ikke / fejl?
+→ Gå til Render → dit projekt → "Logs"
+→ Kopier fejlbesked og spørg Claude
+
+Glemt adgangskode?
+→ Gå til Render → Environment → skift APP_PASSWORD
+→ Klik Save Changes
+
+Vil du opdatere appen med nye filer?
+→ Upload de nye filer til GitHub (samme trin 3)
+→ Render opdaterer automatisk
